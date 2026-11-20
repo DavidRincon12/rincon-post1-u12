@@ -1,0 +1,169 @@
+# Sistema de Solicitudes de Reembolso de Gastos Corporativos
+
+Post-contenido de la Unidad 12 (Patrones de Diseño de Software): proyecto integrador `reembolsos-integrado`, con Spring Boot 3, Java 17, Spring Data JPA y H2.
+
+Los empleados registran una solicitud de reembolso con la categoría del gasto, el monto, la fecha y sus documentos soporte. El sistema valida la solicitud, calcula el monto aprobado según la categoría y avisa a los interesados cada vez que la solicitud cambia de estado.
+
+## Cómo ejecutar
+
+```bash
+mvn spring-boot:run
+```
+
+```bash
+mvn verify
+```
+
+## Diseño Propuesto
+
+Este análisis se escribió antes de implementar cualquier patrón. Para cada requisito se identifica qué varía, qué patrón lo resuelve y por qué ese y no otro (test de explicabilidad: una oración).
+
+| Requisito | Qué varía | Patrón | Justificación (una oración) |
+|---|---|---|---|
+| RF1 — Validación en varias etapas | El conjunto y el orden de las verificaciones que debe pasar una solicitud; Finanzas agregará verificaciones nuevas (p. ej., límite anual acumulado). | **Chain of Responsibility** | Cada verificación es un eslabón que decide por sí solo si rechaza o deja pasar al siguiente, así que una verificación nueva se agrega como un eslabón más sin tocar las existentes. |
+| RF2 — Cálculo distinto por categoría | La fórmula del monto aprobado, que depende de la categoría del gasto; vendrán categorías nuevas (p. ej., "bienestar"). | **Strategy** | Cada categoría encapsula su fórmula en una clase intercambiable detrás de la misma interfaz, de modo que una categoría nueva es una clase nueva y no una rama más en un `switch` compartido. |
+| RF3 — Notificación simultánea | Quiénes reaccionan a un cambio de estado y cómo reacciona cada uno; ya se anunció un cuarto interesado (panel de métricas). | **Observer** | El servicio solo publica "la solicitud cambió de estado" a una lista de observadores, y cada interesado decide su reacción, así que sumar el panel de métricas es agregar un observador sin modificar el servicio. |
+
+Por qué no otras opciones:
+
+- **RF1 no es Strategy:** las verificaciones no son alternativas excluyentes, sino pasos que se ejecutan en secuencia y que cortan al primer rechazo.
+- **RF2 no es Template Method:** las tres fórmulas no comparten un esqueleto de pasos; lo único común es la firma `calcular(solicitud)`.
+- **RF3 no es Chain of Responsibility:** todos los interesados deben enterarse siempre, mientras que en una cadena un eslabón puede detener la propagación.
+
+### Observaciones sobre la especificación
+
+- **Tope de viáticos.** El RF2 define el tope de viaje como un tope diario multiplicado por los días del viaje. Por coherencia, la validación de monto máximo usa ese mismo tope (150.000 × días) para la categoría VIAJE; con un tope fijo de 150.000, un viaje legítimo de 3 días por 400.000 sería rechazado.
+- **Período de duplicados.** El período se interpreta como el mes calendario del gasto (año y mes, `YearMonth`), para que enero de 2025 no se confunda con enero de 2026.
+- **Dominio sin frameworks.** `SolicitudReembolso` no importa Spring ni JPA; su mapeo a la base de datos se declara en `META-INF/orm.xml`.
+
+## Decisiones de diseño
+
+### Decisión 1 — Orden de la cadena de validadores
+
+Orden elegido: **datos obligatorios → documentos soporte → monto máximo → duplicados** (`CadenaValidadores`).
+
+- **Criterio de eficiencia:** la cadena corta en el primer rechazo, así que conviene poner primero lo barato y al final lo caro. Documentos y datos obligatorios leen un campo, el monto consulta un mapa y duplicados recorre toda la lista de pendientes del empleado, que es el único costo que crece con los datos.
+- **Qué se gana:** una solicitud sin documentos o con un monto excesivo se rechaza sin recorrer la lista de pendientes.
+- **Qué se pierde:** si duplicados fuera primero, el empleado vería antes el rechazo por duplicado (que suele ser el más informativo cuando reintenta), pero se pagaría el recorrido en todas las solicitudes, incluso las que iban a caer por documentos. Además, el servicio sigue cargando las pendientes antes de la cadena; mover esa consulta al eslabón la evitaría en los rechazos tempranos, pero metería persistencia en `procesamiento` (ver Regla 1).
+- **Eslabón adicional:** `ValidadorDatosObligatorios` se agregó al inicio sin tocar los otros tres, que es justo la extensión que pide el RF1. Valida en el borde que lleguen empleado, categoría, monto positivo y fecha antes de que los demás eslabones los usen.
+
+### Decisión 2 — Selección de la calculadora por categoría
+
+Elegido: **mapa construido desde la `List<CalculadoraReembolso>` que inyecta Spring** (`SelectorCalculadora`), en lugar de un `switch` sobre `CategoriaGasto`.
+
+- Con el mapa, una categoría nueva ("bienestar") se agrega con una clase nueva anotada con `@Component` y una constante nueva en el enum; `SelectorCalculadora` y las calculadoras existentes no cambian. Con el `switch`, cada categoría nueva obliga a editar el método del selector, que es justo lo que el RF2 pide evitar (principio abierto/cerrado).
+- `Collectors.toMap` falla al arrancar si dos calculadoras declaran la misma categoría, así que un error de configuración se detecta en el arranque y no en una solicitud real.
+- El costo: el flujo es menos explícito que un `switch` (hay que saber que Spring inyecta todas las implementaciones); lo compensa el Javadoc de la interfaz y la prueba `SelectorCalculadoraTest`.
+
+### Decisión 3 — Capas simples vs. Hexagonal (resumen de ADR-001)
+
+Documentada completa en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md). El criterio de la Guía (6.2) se evaluó por separado para cada dependencia externa:
+
+- **Persistencia: capas simples.** `SolicitudReembolsoService` depende directamente de `RepositorioSolicitudesJpa`. Hay una entidad, un repositorio, un consumidor y ningún plan de cambiar de motor: un puerto `RepositorioSolicitudes` sería una interfaz con una sola implementación (YAGNI). El dominio igual queda libre de JPA gracias a `orm.xml`.
+- **Notificación: sin cambios.** `ObservadorCambioEstado` ya es el punto de extensión que necesita la integración con la API de Contabilidad anunciada para el próximo trimestre: solo cambiará el interior de `NotificadorContabilidad`.
+- **Deuda aceptada:** si algún día cambia la persistencia, el puerto se introduce en ese momento; extraerlo con un solo consumidor es mecánico.
+
+### Decisión 4 — Qué prohíbe la Regla 1 de ArchUnit y qué no
+
+La Regla 1 prohíbe que `procesamiento` dependa de `infraestructura`, `adaptadores`, `org.springframework.data` y `jakarta.persistence`, pero no de todo `org.springframework`:
+
+- **`@Component` (estereotipo) es aceptable:** solo marca la clase para que el contenedor la registre. No cambia su comportamiento ni la ata a un recurso externo: las pruebas unitarias crean `new ValidadorDuplicados()` sin Spring, y quitar la anotación no rompe ninguna regla de negocio. Es metadato de ensamblado, no una dependencia de diseño.
+- **Spring Data, JPA y la capa web no lo son:** introducen I/O y conocimiento de cómo se guardan o se transportan los datos. Si un validador inyectara un repositorio, la lógica de negocio dejaría de poder probarse en memoria y cambiar la persistencia obligaría a tocar las reglas. Es exactamente la violación que se probó en el pipeline.
+- **Prohibir todo `org.springframework` sería más estricto que útil:** obligaría a registrar cada validador, calculadora y notificador con `@Bean` en una clase de configuración aparte, y perdería la ventaja que aprovecha la Decisión 2 (que Spring descubra solo las estrategias nuevas) sin ganar aislamiento real.
+
+Ajustes a las reglas del enunciado, encontrados al ejecutarlas:
+
+- **Regla 2** incluye `..adaptadores.rest..` en la lista permitida: que el controlador lea su propio campo `servicio` también cuenta como acceso.
+- **Regla 3** filtra por nombre (`Calculadora*`) porque `SelectorCalculadora` vive en el mismo paquete y no es una estrategia.
+- Las reglas analizan solo el código de producción (`ImportOption.DoNotIncludeTests`); si no, las clases de prueba del paquete `notificacion` violarían la Regla 4.
+- `ReglasArquitectura` no termina en `Test`, así que `pom.xml` la agrega a los `includes` de Surefire para que `mvn verify` también la ejecute.
+
+## Arquitectura resultante
+
+Capas simples con un paquete `procesamiento` para los patrones. Las dependencias van de afuera hacia adentro, y `procesamiento` no conoce ni la persistencia ni la web (Regla 1).
+
+```mermaid
+flowchart LR
+  cliente([Cliente HTTP]) --> rest[adaptadores.rest<br/>Controller + ManejadorErrores]
+  rest --> app[aplicacion<br/>SolicitudReembolsoService]
+  app --> val[procesamiento.validacion<br/>Chain of Responsibility]
+  app --> calc[procesamiento.calculo<br/>Strategy]
+  app --> notif[procesamiento.notificacion<br/>Observer]
+  app --> infra[infraestructura<br/>RepositorioSolicitudesJpa]
+  infra --> db[(H2)]
+  val & calc & notif & app & rest & infra --> dom[dominio<br/>sin Spring ni JPA]
+```
+
+| Paquete | Responsabilidad |
+|---|---|
+| `dominio` | `SolicitudReembolso`, `CategoriaGasto`, `EstadoSolicitud`; sin dependencias de frameworks (mapeo en `META-INF/orm.xml`). |
+| `procesamiento.validacion` | Cadena de validadores (RF1). |
+| `procesamiento.calculo` | Estrategias de cálculo y su selector (RF2). |
+| `procesamiento.notificacion` | Observadores de cambio de estado (RF3). |
+| `aplicacion` | Servicio que coordina los tres patrones y excepciones de aplicación. |
+| `infraestructura` | Repositorio Spring Data JPA. |
+| `adaptadores.rest` | Controlador REST y traducción de errores a Problem Details (422 y 404). |
+
+### API
+
+| Método | Ruta | Cuerpo | Respuesta |
+|---|---|---|---|
+| `POST` | `/api/solicitudes` | `{"empleadoId","categoria","montoSolicitado","fechaGasto","diasViaje","documentosSoporte"}` | 200 con la solicitud `PENDIENTE` y su `montoAprobado`; 422 con el motivo si no pasa la validación |
+| `PUT` | `/api/solicitudes/{id}/estado` | `"APROBADA"`, `"RECHAZADA"` o `"REQUIERE_CORRECCION"` | 200 y notifica a los observadores; 404 si no existe |
+
+## Qué se descartó y por qué
+
+Criterio (Guía, sección 4.2): ¿la variabilidad que justificaría la alternativa es real y está documentada hoy, o es especulación sobre un futuro que aún no llegó? Cada descarte es una decisión vigente hoy, no definitiva: se indica la señal que haría reconsiderarla.
+
+### 1. `ApplicationEventPublisher` en vez de una lista de observadores inyectada (referencia)
+
+- **Qué se consideró:** publicar un evento de dominio con `ApplicationEventPublisher` y `@EventListener` (Guía, sección 2.3), en lugar de inyectar `List<ObservadorCambioEstado>` en el servicio.
+- **Por qué se descartó:** con tres observadores fijos y conocidos en tiempo de compilación, un bus de eventos genérico no aporta desacoplamiento real (ya lo da la interfaz `ObservadorCambioEstado`) y sí dificulta rastrear en el código quién reacciona a qué cambio.
+- **Señal para reconsiderar:** que algún interesado deba reaccionar de forma asíncrona o después del commit de la transacción (`@TransactionalEventListener`), por ejemplo cuando la API externa de Contabilidad sea lenta y no deba bloquear la respuesta.
+
+### 2. Visitor o Abstract Factory para exportar reportes en varios formatos (referencia)
+
+- **Qué se consideró:** anticipar exportaciones del historial en PDF y Excel además de CSV con una jerarquía de exportadores.
+- **Por qué se descartó:** hoy solo existe el requisito de CSV; no hay una segunda solicitud real de otro formato, así que no se cumple la Rule of Three.
+- **Señal para reconsiderar:** una segunda petición concreta de formato (por ejemplo, Excel para el reporte trimestral de auditoría).
+
+### 3. Patrón State para las transiciones de `EstadoSolicitud` (propio)
+
+- **Qué se consideró:** al escribir `cambiarEstado`, fue tentador modelar cada estado (`PENDIENTE`, `APROBADA`, `RECHAZADA`, `REQUIERE_CORRECCION`) como una clase con sus transiciones permitidas, para impedir, por ejemplo, aprobar una solicitud ya rechazada.
+- **Por qué se descartó:** la especificación no define ninguna regla de transición; solo dice que, ante un cambio de estado, se notifica a los interesados. Inventar esas reglas sería resolver un problema que Finanzas no ha planteado (YAGNI), y aplicando el test de explicabilidad no hay hoy una oración que justifique cuatro clases de estado: "porque los estados podrían tener reglas" describe un futuro posible, no un requisito. Un `enum` y una asignación cubren el comportamiento pedido.
+- **Señal para reconsiderar:** que Finanzas defina reglas de transición reales (por ejemplo, que solo el empleado pueda pasar de `REQUIERE_CORRECCION` a `PENDIENTE`, o que una solicitud aprobada no pueda volver a cambiar). Con dos o tres de esas reglas, primero bastaría una tabla de transiciones permitidas en el enum; State entraría si cada estado necesitara además comportamiento propio.
+
+### 4. Puerto de persistencia `RepositorioSolicitudes` (propio, ver ADR-001)
+
+- **Qué se consideró:** una interfaz de puerto entre el servicio y Spring Data, por simetría con una arquitectura Hexagonal.
+- **Por qué se descartó:** una interfaz con una sola implementación y sin plan de cambiar de motor es una abstracción especulativa; el dominio ya quedó libre de JPA gracias a `orm.xml`, que era el beneficio real que se buscaba.
+- **Señal para reconsiderar:** un cambio de motor o de tecnología de persistencia anunciado, o un segundo consumidor de la persistencia.
+
+## Pruebas
+
+`mvn verify` ejecuta 35 pruebas:
+
+- **Unitarias (25):** un archivo por validador (4) y por calculadora (3), más la cadena, el selector y los tres notificadores. No levantan Spring.
+- **Integración (6):** `FlujoSolicitudReembolsoTest` (`@SpringBootTest` + MockMvc + H2) recorre el flujo completo por HTTP: las tres categorías, el rechazo sin documentos, el duplicado, el intento de sobrescribir otra solicitud enviando su `id`, la notificación a los tres interesados (Contabilidad solo en `APROBADA`) y el 404.
+- **Arquitectura (4):** `ReglasArquitectura` con ArchUnit.
+
+## Evidencia del pipeline
+
+El workflow [`.github/workflows/arquitectura.yml`](.github/workflows/arquitectura.yml) ejecuta primero las reglas ArchUnit y después la suite completa. Para comprobar que detecta violaciones se hizo un commit que agrega a `ValidadorDuplicados` un campo de tipo `RepositorioSolicitudesJpa` (un `import` sin uso no basta, porque ArchUnit analiza el bytecode) y luego se revirtió:
+
+| Commit | Qué hace | Resultado |
+|---|---|---|
+| `9d23378` | Introduce la violación de la Regla 1 | [Falla](https://github.com/DavidRincon12/rincon-post1-u12/actions/runs/44816069698): `ReglasArquitectura` 4 pruebas, 1 fallo (`procesamientoSinPersistenciaNiWeb`) |
+| `1953fb2` | Revierte la violación | [Verde](https://github.com/DavidRincon12/rincon-post1-u12/actions/runs/44816354017) |
+
+Historial de ejecuciones:
+
+![Historial de GitHub Actions con el build fallido y el build en verde](docs/evidencia/actions-historial.png)
+
+Build fallido por la violación intencional:
+
+![Build fallido por la violación de la Regla 1](docs/evidencia/actions-violacion.png)
+
+Build en verde tras el revert:
+
+![Build en verde tras revertir la violación](docs/evidencia/actions-revert.png)
