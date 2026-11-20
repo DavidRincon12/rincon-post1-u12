@@ -35,3 +35,22 @@ Por qué no otras opciones:
 - **Tope de viáticos.** El RF2 define el tope de viaje como un tope diario multiplicado por los días del viaje. Por coherencia, la validación de monto máximo usa ese mismo tope (150.000 × días) para la categoría VIAJE; con un tope fijo de 150.000, un viaje legítimo de 3 días por 400.000 sería rechazado.
 - **Período de duplicados.** El período se interpreta como el mes calendario del gasto (año y mes, `YearMonth`), para que enero de 2025 no se confunda con enero de 2026.
 - **Dominio sin frameworks.** `SolicitudReembolso` no importa Spring ni JPA; su mapeo a la base de datos se declara en `META-INF/orm.xml`.
+
+## Decisiones de diseño
+
+### Decisión 1 — Orden de la cadena de validadores
+
+Orden elegido: **datos obligatorios → documentos soporte → monto máximo → duplicados** (`CadenaValidadores`).
+
+- **Criterio de eficiencia:** la cadena corta en el primer rechazo, así que conviene poner primero lo barato y al final lo caro. Documentos y datos obligatorios leen un campo, el monto consulta un mapa y duplicados recorre toda la lista de pendientes del empleado, que es el único costo que crece con los datos.
+- **Qué se gana:** una solicitud sin documentos o con un monto excesivo se rechaza sin recorrer la lista de pendientes.
+- **Qué se pierde:** si duplicados fuera primero, el empleado vería antes el rechazo por duplicado (que suele ser el más informativo cuando reintenta), pero se pagaría el recorrido en todas las solicitudes, incluso las que iban a caer por documentos. Además, el servicio sigue cargando las pendientes antes de la cadena; mover esa consulta al eslabón la evitaría en los rechazos tempranos, pero metería persistencia en `procesamiento` (ver Regla 1).
+- **Eslabón adicional:** `ValidadorDatosObligatorios` se agregó al inicio sin tocar los otros tres, que es justo la extensión que pide el RF1. Valida en el borde que lleguen empleado, categoría, monto positivo y fecha antes de que los demás eslabones los usen.
+
+### Decisión 2 — Selección de la calculadora por categoría
+
+Elegido: **mapa construido desde la `List<CalculadoraReembolso>` que inyecta Spring** (`SelectorCalculadora`), en lugar de un `switch` sobre `CategoriaGasto`.
+
+- Con el mapa, una categoría nueva ("bienestar") se agrega con una clase nueva anotada con `@Component` y una constante nueva en el enum; `SelectorCalculadora` y las calculadoras existentes no cambian. Con el `switch`, cada categoría nueva obliga a editar el método del selector, que es justo lo que el RF2 pide evitar (principio abierto/cerrado).
+- `Collectors.toMap` falla al arrancar si dos calculadoras declaran la misma categoría, así que un error de configuración se detecta en el arranque y no en una solicitud real.
+- El costo: el flujo es menos explícito que un `switch` (hay que saber que Spring inyecta todas las implementaciones); lo compensa el Javadoc de la interfaz y la prueba `SelectorCalculadoraTest`.
