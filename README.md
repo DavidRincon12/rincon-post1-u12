@@ -54,3 +54,31 @@ Elegido: **mapa construido desde la `List<CalculadoraReembolso>` que inyecta Spr
 - Con el mapa, una categoría nueva ("bienestar") se agrega con una clase nueva anotada con `@Component` y una constante nueva en el enum; `SelectorCalculadora` y las calculadoras existentes no cambian. Con el `switch`, cada categoría nueva obliga a editar el método del selector, que es justo lo que el RF2 pide evitar (principio abierto/cerrado).
 - `Collectors.toMap` falla al arrancar si dos calculadoras declaran la misma categoría, así que un error de configuración se detecta en el arranque y no en una solicitud real.
 - El costo: el flujo es menos explícito que un `switch` (hay que saber que Spring inyecta todas las implementaciones); lo compensa el Javadoc de la interfaz y la prueba `SelectorCalculadoraTest`.
+
+## Qué se descartó y por qué
+
+Criterio (Guía, sección 4.2): ¿la variabilidad que justificaría la alternativa es real y está documentada hoy, o es especulación sobre un futuro que aún no llegó? Cada descarte es una decisión vigente hoy, no definitiva: se indica la señal que haría reconsiderarla.
+
+### 1. `ApplicationEventPublisher` en vez de una lista de observadores inyectada (referencia)
+
+- **Qué se consideró:** publicar un evento de dominio con `ApplicationEventPublisher` y `@EventListener` (Guía, sección 2.3), en lugar de inyectar `List<ObservadorCambioEstado>` en el servicio.
+- **Por qué se descartó:** con tres observadores fijos y conocidos en tiempo de compilación, un bus de eventos genérico no aporta desacoplamiento real (ya lo da la interfaz `ObservadorCambioEstado`) y sí dificulta rastrear en el código quién reacciona a qué cambio.
+- **Señal para reconsiderar:** que algún interesado deba reaccionar de forma asíncrona o después del commit de la transacción (`@TransactionalEventListener`), por ejemplo cuando la API externa de Contabilidad sea lenta y no deba bloquear la respuesta.
+
+### 2. Visitor o Abstract Factory para exportar reportes en varios formatos (referencia)
+
+- **Qué se consideró:** anticipar exportaciones del historial en PDF y Excel además de CSV con una jerarquía de exportadores.
+- **Por qué se descartó:** hoy solo existe el requisito de CSV; no hay una segunda solicitud real de otro formato, así que no se cumple la Rule of Three.
+- **Señal para reconsiderar:** una segunda petición concreta de formato (por ejemplo, Excel para el reporte trimestral de auditoría).
+
+### 3. Patrón State para las transiciones de `EstadoSolicitud` (propio)
+
+- **Qué se consideró:** al escribir `cambiarEstado`, fue tentador modelar cada estado (`PENDIENTE`, `APROBADA`, `RECHAZADA`, `REQUIERE_CORRECCION`) como una clase con sus transiciones permitidas, para impedir, por ejemplo, aprobar una solicitud ya rechazada.
+- **Por qué se descartó:** la especificación no define ninguna regla de transición; solo dice que, ante un cambio de estado, se notifica a los interesados. Inventar esas reglas sería resolver un problema que Finanzas no ha planteado (YAGNI), y aplicando el test de explicabilidad no hay hoy una oración que justifique cuatro clases de estado: "porque los estados podrían tener reglas" describe un futuro posible, no un requisito. Un `enum` y una asignación cubren el comportamiento pedido.
+- **Señal para reconsiderar:** que Finanzas defina reglas de transición reales (por ejemplo, que solo el empleado pueda pasar de `REQUIERE_CORRECCION` a `PENDIENTE`, o que una solicitud aprobada no pueda volver a cambiar). Con dos o tres de esas reglas, primero bastaría una tabla de transiciones permitidas en el enum; State entraría si cada estado necesitara además comportamiento propio.
+
+### 4. Puerto de persistencia `RepositorioSolicitudes` (propio, ver ADR-001)
+
+- **Qué se consideró:** una interfaz de puerto entre el servicio y Spring Data, por simetría con una arquitectura Hexagonal.
+- **Por qué se descartó:** una interfaz con una sola implementación y sin plan de cambiar de motor es una abstracción especulativa; el dominio ya quedó libre de JPA gracias a `orm.xml`, que era el beneficio real que se buscaba.
+- **Señal para reconsiderar:** un cambio de motor o de tecnología de persistencia anunciado, o un segundo consumidor de la persistencia.
