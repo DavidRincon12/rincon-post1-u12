@@ -55,6 +55,62 @@ Elegido: **mapa construido desde la `List<CalculadoraReembolso>` que inyecta Spr
 - `Collectors.toMap` falla al arrancar si dos calculadoras declaran la misma categoría, así que un error de configuración se detecta en el arranque y no en una solicitud real.
 - El costo: el flujo es menos explícito que un `switch` (hay que saber que Spring inyecta todas las implementaciones); lo compensa el Javadoc de la interfaz y la prueba `SelectorCalculadoraTest`.
 
+### Decisión 3 — Capas simples vs. Hexagonal (resumen de ADR-001)
+
+Documentada completa en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md). El criterio de la Guía (6.2) se evaluó por separado para cada dependencia externa:
+
+- **Persistencia: capas simples.** `SolicitudReembolsoService` depende directamente de `RepositorioSolicitudesJpa`. Hay una entidad, un repositorio, un consumidor y ningún plan de cambiar de motor: un puerto `RepositorioSolicitudes` sería una interfaz con una sola implementación (YAGNI). El dominio igual queda libre de JPA gracias a `orm.xml`.
+- **Notificación: sin cambios.** `ObservadorCambioEstado` ya es el punto de extensión que necesita la integración con la API de Contabilidad anunciada para el próximo trimestre: solo cambiará el interior de `NotificadorContabilidad`.
+- **Deuda aceptada:** si algún día cambia la persistencia, el puerto se introduce en ese momento; extraerlo con un solo consumidor es mecánico.
+
+### Decisión 4 — Qué prohíbe la Regla 1 de ArchUnit y qué no
+
+La Regla 1 prohíbe que `procesamiento` dependa de `infraestructura`, `adaptadores`, `org.springframework.data` y `jakarta.persistence`, pero no de todo `org.springframework`:
+
+- **`@Component` (estereotipo) es aceptable:** solo marca la clase para que el contenedor la registre. No cambia su comportamiento ni la ata a un recurso externo: las pruebas unitarias crean `new ValidadorDuplicados()` sin Spring, y quitar la anotación no rompe ninguna regla de negocio. Es metadato de ensamblado, no una dependencia de diseño.
+- **Spring Data, JPA y la capa web no lo son:** introducen I/O y conocimiento de cómo se guardan o se transportan los datos. Si un validador inyectara un repositorio, la lógica de negocio dejaría de poder probarse en memoria y cambiar la persistencia obligaría a tocar las reglas. Es exactamente la violación que se probó en el pipeline.
+- **Prohibir todo `org.springframework` sería más estricto que útil:** obligaría a registrar cada validador, calculadora y notificador con `@Bean` en una clase de configuración aparte, y perdería la ventaja que aprovecha la Decisión 2 (que Spring descubra solo las estrategias nuevas) sin ganar aislamiento real.
+
+Ajustes a las reglas del enunciado, encontrados al ejecutarlas:
+
+- **Regla 2** incluye `..adaptadores.rest..` en la lista permitida: que el controlador lea su propio campo `servicio` también cuenta como acceso.
+- **Regla 3** filtra por nombre (`Calculadora*`) porque `SelectorCalculadora` vive en el mismo paquete y no es una estrategia.
+- Las reglas analizan solo el código de producción (`ImportOption.DoNotIncludeTests`); si no, las clases de prueba del paquete `notificacion` violarían la Regla 4.
+- `ReglasArquitectura` no termina en `Test`, así que `pom.xml` la agrega a los `includes` de Surefire para que `mvn verify` también la ejecute.
+
+## Arquitectura resultante
+
+Capas simples con un paquete `procesamiento` para los patrones. Las dependencias van de afuera hacia adentro, y `procesamiento` no conoce ni la persistencia ni la web (Regla 1).
+
+```mermaid
+flowchart LR
+  cliente([Cliente HTTP]) --> rest[adaptadores.rest<br/>Controller + ManejadorErrores]
+  rest --> app[aplicacion<br/>SolicitudReembolsoService]
+  app --> val[procesamiento.validacion<br/>Chain of Responsibility]
+  app --> calc[procesamiento.calculo<br/>Strategy]
+  app --> notif[procesamiento.notificacion<br/>Observer]
+  app --> infra[infraestructura<br/>RepositorioSolicitudesJpa]
+  infra --> db[(H2)]
+  val & calc & notif & app & rest & infra --> dom[dominio<br/>sin Spring ni JPA]
+```
+
+| Paquete | Responsabilidad |
+|---|---|
+| `dominio` | `SolicitudReembolso`, `CategoriaGasto`, `EstadoSolicitud`; sin dependencias de frameworks (mapeo en `META-INF/orm.xml`). |
+| `procesamiento.validacion` | Cadena de validadores (RF1). |
+| `procesamiento.calculo` | Estrategias de cálculo y su selector (RF2). |
+| `procesamiento.notificacion` | Observadores de cambio de estado (RF3). |
+| `aplicacion` | Servicio que coordina los tres patrones y excepciones de aplicación. |
+| `infraestructura` | Repositorio Spring Data JPA. |
+| `adaptadores.rest` | Controlador REST y traducción de errores a Problem Details (422 y 404). |
+
+### API
+
+| Método | Ruta | Cuerpo | Respuesta |
+|---|---|---|---|
+| `POST` | `/api/solicitudes` | `{"empleadoId","categoria","montoSolicitado","fechaGasto","diasViaje","documentosSoporte"}` | 200 con la solicitud `PENDIENTE` y su `montoAprobado`; 422 con el motivo si no pasa la validación |
+| `PUT` | `/api/solicitudes/{id}/estado` | `"APROBADA"`, `"RECHAZADA"` o `"REQUIERE_CORRECCION"` | 200 y notifica a los observadores; 404 si no existe |
+
 ## Qué se descartó y por qué
 
 Criterio (Guía, sección 4.2): ¿la variabilidad que justificaría la alternativa es real y está documentada hoy, o es especulación sobre un futuro que aún no llegó? Cada descarte es una decisión vigente hoy, no definitiva: se indica la señal que haría reconsiderarla.
@@ -82,3 +138,32 @@ Criterio (Guía, sección 4.2): ¿la variabilidad que justificaría la alternati
 - **Qué se consideró:** una interfaz de puerto entre el servicio y Spring Data, por simetría con una arquitectura Hexagonal.
 - **Por qué se descartó:** una interfaz con una sola implementación y sin plan de cambiar de motor es una abstracción especulativa; el dominio ya quedó libre de JPA gracias a `orm.xml`, que era el beneficio real que se buscaba.
 - **Señal para reconsiderar:** un cambio de motor o de tecnología de persistencia anunciado, o un segundo consumidor de la persistencia.
+
+## Pruebas
+
+`mvn verify` ejecuta 35 pruebas:
+
+- **Unitarias (25):** un archivo por validador (4) y por calculadora (3), más la cadena, el selector y los tres notificadores. No levantan Spring.
+- **Integración (6):** `FlujoSolicitudReembolsoTest` (`@SpringBootTest` + MockMvc + H2) recorre el flujo completo por HTTP: las tres categorías, el rechazo sin documentos, el duplicado, el intento de sobrescribir otra solicitud enviando su `id`, la notificación a los tres interesados (Contabilidad solo en `APROBADA`) y el 404.
+- **Arquitectura (4):** `ReglasArquitectura` con ArchUnit.
+
+## Evidencia del pipeline
+
+El workflow [`.github/workflows/arquitectura.yml`](.github/workflows/arquitectura.yml) ejecuta primero las reglas ArchUnit y después la suite completa. Para comprobar que detecta violaciones se hizo un commit que agrega a `ValidadorDuplicados` un campo de tipo `RepositorioSolicitudesJpa` (un `import` sin uso no basta, porque ArchUnit analiza el bytecode) y luego se revirtió:
+
+| Commit | Qué hace | Resultado |
+|---|---|---|
+| `9d23378` | Introduce la violación de la Regla 1 | [Falla](https://github.com/DavidRincon12/rincon-post1-u12/actions/runs/44816069698): `ReglasArquitectura` 4 pruebas, 1 fallo (`procesamientoSinPersistenciaNiWeb`) |
+| `1953fb2` | Revierte la violación | [Verde](https://github.com/DavidRincon12/rincon-post1-u12/actions/runs/44816354017) |
+
+Historial de ejecuciones:
+
+![Historial de GitHub Actions con el build fallido y el build en verde](docs/evidencia/actions-historial.png)
+
+Build fallido por la violación intencional:
+
+![Build fallido por la violación de la Regla 1](docs/evidencia/actions-violacion.png)
+
+Build en verde tras el revert:
+
+![Build en verde tras revertir la violación](docs/evidencia/actions-revert.png)
