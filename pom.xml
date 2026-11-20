@@ -49,6 +49,17 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <!-- patron por defecto de Surefire mas la clase de reglas ArchUnit, que no termina en Test -->
+                        <include>**/*Test.java</include>
+                        <include>**/ReglasArquitectura.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
